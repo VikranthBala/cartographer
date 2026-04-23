@@ -95,6 +95,7 @@ type classifierRule struct {
 	Category string `json:"category"`
 }
 
+// todo: improve this
 func (c *Classifier) askGemini(host string, port int) Rule {
 	if v, ok := c.cache.Load(host); ok {
 		return v.(Rule)
