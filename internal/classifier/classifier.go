@@ -97,19 +97,18 @@ type classifierRule struct {
 
 // todo: improve this
 func (c *Classifier) askGemini(host string, port int) Rule {
-	if v, ok := c.cache.Load(host); ok {
+	key := fmt.Sprintf("%s:%d", host, port)
+	if v, ok := c.cache.Load(key); ok {
 		return v.(Rule)
 	}
 
 	prompt := fmt.Sprintf(`You are a network traffic classifier.
-Given a hostname and port, return ONLY a JSON object with two fields:
-- "label": short service name (e.g. "GitHub", "Slack", "Unknown")
-- "category": one of [dev-tool, social, productivity, cloud, cdn, database, remote-access, web, network, unknown]
+Given a hostname and port, return ONLY a JSON object with:
+- "label": short service name
+- "category": one of ["infra","dev","social","cdn","unknown"]
 
 Hostname: %s
-Port: %d
-
-Respond with only the JSON object, no explanation.`, host, port)
+Port: %d`, host, port)
 
 	body, err := json.Marshal(geminiRequest{
 		Contents: []geminiContent{
@@ -130,7 +129,6 @@ Respond with only the JSON object, no explanation.`, host, port)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		fmt.Println("err do: ", err)
 		return Rule{Label: "Unknown", Category: "unknown"}
 	}
 	defer resp.Body.Close()
@@ -139,39 +137,78 @@ Respond with only the JSON object, no explanation.`, host, port)
 	if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
 		return Rule{Label: "Unknown", Category: "unknown"}
 	}
+
 	if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
 		return Rule{Label: "Unknown", Category: "unknown"}
 	}
 
-	var rule classifierRule
-	if err := json.Unmarshal([]byte(geminiResp.Candidates[0].Content.Parts[0].Text), &rule); err != nil {
+	// Gemini sometimes wraps JSON in ```json fences, strip them
+	text := geminiResp.Candidates[0].Content.Parts[0].Text
+	text = strings.TrimSpace(text)
+	text = strings.TrimPrefix(text, "```json")
+	text = strings.TrimPrefix(text, "```")
+	text = strings.TrimSuffix(text, "```")
+
+	var rule Rule
+	if err := json.Unmarshal([]byte(text), &rule); err != nil {
 		return Rule{Label: "Unknown", Category: "unknown"}
 	}
 
-	result := Rule{Label: rule.Label, Category: rule.Category}
-	c.cache.Store(host, result)
-	return result
+	c.cache.Store(key, rule)
+	return rule
+}
+
+func normalizeHost(host string) string {
+	host = strings.TrimSpace(host)
+	host = strings.TrimSuffix(host, ".") // PTR often adds trailing dot
+	host = strings.ToLower(host)
+	return host
 }
 
 func (c *Classifier) classify(ec collector.EnrichedConn) collector.EnrichedConn {
-	// 1. Port rules
+	host := normalizeHost(ec.RemoteHost)
+
+	// 1. Strongest signal: hostname match
+	if host != "" {
+		if rule, ok := c.matchHostname(host); ok {
+			ec.ServiceLabel = rule.Label
+			ec.Category = rule.Category
+			return ec
+		}
+	}
+
+	// 2. Port-based rules (weaker signal)
 	if rule, ok := c.portRules[ec.RemotePort]; ok {
 		ec.ServiceLabel = rule.Label
 		ec.Category = rule.Category
 		return ec
 	}
 
-	// 2. Hostname suffix match
-	if rule, ok := c.matchHostname(ec.RemoteHost); ok {
-		ec.ServiceLabel = rule.Label
-		ec.Category = rule.Category
+	// 3. Heuristics (cheap + useful)
+	if host == "" {
+		if ec.RemoteAddr.IsLoopback() {
+			ec.ServiceLabel = "Loopback"
+			ec.Category = "network"
+			return ec
+		}
+
+		if ec.RemoteAddr.IsPrivate() {
+			ec.ServiceLabel = "Local Network"
+			ec.Category = "network"
+			return ec
+		}
+
+		// No hostname → skip Gemini completely
+		ec.ServiceLabel = "Unknown"
+		ec.Category = "unknown"
 		return ec
 	}
 
-	// 3. Gemini fallback
-	rule := c.askGemini(ec.RemoteHost, ec.RemotePort)
+	// 4. Gemini fallback (only if host exists)
+	rule := c.askGemini(host, ec.RemotePort)
 	ec.ServiceLabel = rule.Label
 	ec.Category = rule.Category
+
 	return ec
 }
 
