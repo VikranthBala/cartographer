@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/vikranthBala/cartographer/internal/collector"
 )
@@ -23,6 +24,7 @@ type Classifier struct {
 	portRules map[int]Rule
 	hostRules map[string]Rule
 	apiKey    string
+	client    *http.Client
 }
 
 func NewClassifier() (*Classifier, error) {
@@ -33,6 +35,9 @@ func NewClassifier() (*Classifier, error) {
 
 	return &Classifier{
 		apiKey: apiKey,
+		client: &http.Client{
+			Timeout: 5 * time.Second, // Prevent API hangs from breaking the pipeline
+		},
 		portRules: map[int]Rule{
 			22:    {Label: "SSH", Category: "remote-access"},
 			53:    {Label: "DNS", Category: "network"},
@@ -71,7 +76,6 @@ func (c *Classifier) matchHostname(host string) (Rule, bool) {
 	return Rule{}, false
 }
 
-// Gemini request/response types
 type geminiRequest struct {
 	Contents []geminiContent `json:"contents"`
 }
@@ -90,12 +94,6 @@ type geminiResponse struct {
 	} `json:"candidates"`
 }
 
-type classifierRule struct {
-	Label    string `json:"label"`
-	Category string `json:"category"`
-}
-
-// todo: improve this
 func (c *Classifier) askGemini(host string, port int) Rule {
 	key := fmt.Sprintf("%s:%d", host, port)
 	if v, ok := c.cache.Load(key); ok {
@@ -127,7 +125,7 @@ Port: %d`, host, port)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-goog-api-key", c.apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.client.Do(req)
 	if err != nil {
 		return Rule{Label: "Unknown", Category: "unknown"}
 	}
@@ -142,7 +140,6 @@ Port: %d`, host, port)
 		return Rule{Label: "Unknown", Category: "unknown"}
 	}
 
-	// Gemini sometimes wraps JSON in ```json fences, strip them
 	text := geminiResp.Candidates[0].Content.Parts[0].Text
 	text = strings.TrimSpace(text)
 	text = strings.TrimPrefix(text, "```json")
@@ -160,7 +157,7 @@ Port: %d`, host, port)
 
 func normalizeHost(host string) string {
 	host = strings.TrimSpace(host)
-	host = strings.TrimSuffix(host, ".") // PTR often adds trailing dot
+	host = strings.TrimSuffix(host, ".")
 	host = strings.ToLower(host)
 	return host
 }
@@ -168,7 +165,6 @@ func normalizeHost(host string) string {
 func (c *Classifier) classify(ec collector.EnrichedConn) collector.EnrichedConn {
 	host := normalizeHost(ec.RemoteHost)
 
-	// 1. Strongest signal: hostname match
 	if host != "" {
 		if rule, ok := c.matchHostname(host); ok {
 			ec.ServiceLabel = rule.Label
@@ -177,34 +173,28 @@ func (c *Classifier) classify(ec collector.EnrichedConn) collector.EnrichedConn 
 		}
 	}
 
-	// 2. Port-based rules (weaker signal)
 	if rule, ok := c.portRules[ec.RemotePort]; ok {
 		ec.ServiceLabel = rule.Label
 		ec.Category = rule.Category
 		return ec
 	}
 
-	// 3. Heuristics (cheap + useful)
 	if host == "" {
 		if ec.RemoteAddr.IsLoopback() {
 			ec.ServiceLabel = "Loopback"
 			ec.Category = "network"
 			return ec
 		}
-
 		if ec.RemoteAddr.IsPrivate() {
 			ec.ServiceLabel = "Local Network"
 			ec.Category = "network"
 			return ec
 		}
-
-		// No hostname → skip Gemini completely
 		ec.ServiceLabel = "Unknown"
 		ec.Category = "unknown"
 		return ec
 	}
 
-	// 4. Gemini fallback (only if host exists)
 	rule := c.askGemini(host, ec.RemotePort)
 	ec.ServiceLabel = rule.Label
 	ec.Category = rule.Category
@@ -212,14 +202,34 @@ func (c *Classifier) classify(ec collector.EnrichedConn) collector.EnrichedConn 
 	return ec
 }
 
+// Classify uses a worker pool to prevent slow Gemini lookups from blocking the pipeline
 func (c *Classifier) Classify(ctx context.Context, in <-chan collector.EnrichedConn, out chan<- collector.EnrichedConn) {
+	sem := make(chan struct{}, 10) // Allow 10 concurrent requests
+	var wg sync.WaitGroup
+
 	for conn := range in {
 		select {
 		case <-ctx.Done():
-			return
+			break
 		default:
 		}
-		out <- c.classify(conn)
+
+		sem <- struct{}{}
+		wg.Add(1)
+
+		go func(ec collector.EnrichedConn) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			result := c.classify(ec)
+
+			select {
+			case out <- result:
+			case <-ctx.Done():
+			}
+		}(conn)
 	}
+
+	wg.Wait()
 	close(out)
 }

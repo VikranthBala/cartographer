@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"time"
 )
 
 type Conn struct {
@@ -33,15 +32,6 @@ type EnrichedConn struct {
 	RemoteHost   string
 	ServiceLabel string
 	Category     string
-}
-
-// runtime graph
-type Node struct {
-	EnrichedConn
-
-	ID        string
-	LastSeen  time.Time
-	FirstSeen time.Time
 }
 
 func (c *Conn) Key() string {
